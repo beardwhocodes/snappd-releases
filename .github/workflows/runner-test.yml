@@ -1,9 +1,0 @@
-name: Runner test
-on: workflow_dispatch
-permissions: {}
-jobs:
-  test:
-    runs-on: xcode-27
-    timeout-minutes: 5
-    steps:
-      - run: sw_vers && xcodebuild -version
