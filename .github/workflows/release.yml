@@ -1,0 +1,104 @@
+# Builds, signs and publishes a version of Snappd. The source is in a private repository.
+# Start it from that repository with app/scripts/release-on-github.sh, which passes the version tag.
+#
+# This repository is public, and so are these logs. The output of the build is hidden, because a compiler
+# message shows lines of the source. To see a failed build, run app/scripts/release.sh --dry-run on a Mac.
+#
+# Secrets:
+#   SOURCE_DEPLOY_KEY: a deploy key that can only read the source repository.
+#   SIGNING_IDENTITY_P12, SIGNING_KEYCHAIN_PASSWORD: the identity "Snappd Local Signing". Each release must have
+#     the same identity, or macOS asks each user again for the Screen Recording permission.
+#   UPDATE_SIGNING_KEY: signs the updates. The apps that are installed accept only this key.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "The version tag in the source repository, for example v1.2.3. For a dry run: main."
+        required: true
+      dry_run:
+        description: "Build and sign, and publish nothing."
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # The app needs the macOS 27 SDK. This image is a preview at GitHub.
+    runs-on: xcode-27
+    timeout-minutes: 30
+    env:
+      REF: ${{ inputs.ref }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      GIT_SSH_COMMAND: ssh -i ~/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/github_host -o StrictHostKeyChecking=yes
+    steps:
+      - name: Get the source
+        env:
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -eu
+          printf '%s' "$REF" | grep -Eq '^(main|v[0-9]+\.[0-9]+\.[0-9]+)$' || { echo "The ref must be main or a tag such as v1.2.3."; exit 1; }
+          if [ "$DRY_RUN" != "true" ] && [ "$REF" = "main" ]; then echo "A release needs a version tag."; exit 1; fi
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > ~/.ssh/source
+          # The host key of GitHub, from https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+          printf '%s\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/github_host
+          # The full history: the build number is the number of commits.
+          git clone --quiet git@github.com:beardwhocodes/snappd.git source
+          git -C source checkout --quiet "$REF"
+          echo "Source: $REF, commit $(git -C source rev-parse --short HEAD)"
+      # Put the secrets where the scripts look for them on a Mac.
+      - name: Restore the signing identity and the update key
+        env:
+          SIGNING_IDENTITY_P12: ${{ secrets.SIGNING_IDENTITY_P12 }}
+          SIGNING_KEYCHAIN_PASSWORD: ${{ secrets.SIGNING_KEYCHAIN_PASSWORD }}
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          set -eu
+          umask 077
+          mkdir -p "$HOME/.config/snappd"
+          printf '%s' "$SIGNING_KEYCHAIN_PASSWORD" > "$HOME/.config/snappd/signing-keychain-password"
+          printf '%s' "$UPDATE_SIGNING_KEY" > "$HOME/.config/snappd/update-signing-key"
+          keychain="$HOME/Library/Keychains/snappd-signing.keychain-db"
+          printf '%s' "$SIGNING_IDENTITY_P12" | base64 --decode > "$RUNNER_TEMP/identity.p12"
+          security create-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/identity.p12" -k "$keychain" -P "$SIGNING_KEYCHAIN_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$SIGNING_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          # codesign looks for an identity only in the keychains of the search list.
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/identity.p12"
+      - name: Release, or do a dry run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The step must go on after a failed release, to print the reason.
+          set +e
+          cd source
+          if [ "$DRY_RUN" = "true" ]; then
+            app/scripts/release.sh --dry-run > "$RUNNER_TEMP/release.log" 2>&1
+          else
+            RELEASE_TAG="$REF" app/scripts/release.sh > "$RUNNER_TEMP/release.log" 2>&1
+          fi
+          status=$?
+          # Only the lines of the release script itself. The output of the compiler stays hidden.
+          grep -E '^(No release:|Built |Released |Dry run:|No published feed|Wrote |https://github.com/)' "$RUNNER_TEMP/release.log" || true
+          if [ "$status" != 0 ]; then
+            echo "The release failed. The build output is hidden. Run app/scripts/release.sh --dry-run on a Mac to see it."
+            exit 1
+          fi
+      - name: Check the signature
+        run: |
+          codesign --verify --deep --strict source/app/build/Snappd.app
+          # The same line for each release: the app and the certificate that signed it.
+          codesign -d -r- source/app/build/Snappd.app 2>&1 | tail -1
+          hdiutil imageinfo source/app/build/release/Snappd.dmg >/dev/null && echo "The disk image is good."
