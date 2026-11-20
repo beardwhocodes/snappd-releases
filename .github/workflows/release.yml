@@ -22,22 +22,40 @@ on:
         type: boolean
         default: false
 
+# Each job gets only what it needs (see the jobs).
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  # The two builds run at the same time, each on its own Mac, so the release takes the time of one build.
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: arm64
+            app: source/app/build/Snappd.app
+            files: source/app/build/release
+            image: source/app/build/release/Snappd.dmg
+          - arch: x86_64
+            app: source/app/build/intel/Snappd.app
+            files: source/app/build/release-intel
+            image: source/app/build/release-intel/Snappd-intel.dmg
+    name: build (${{ matrix.arch }})
     # The app needs the macOS 27 SDK. This image is a preview at GitHub.
     runs-on: xcode-27
     timeout-minutes: 30
+    permissions:
+      contents: read
     env:
       REF: ${{ inputs.ref }}
       DRY_RUN: ${{ inputs.dry_run }}
       GIT_SSH_COMMAND: ssh -i ~/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/github_host -o StrictHostKeyChecking=yes
+      ARCH: ${{ matrix.arch }}
     steps:
       - name: Get the source
         env:
@@ -77,28 +95,86 @@ jobs:
           # codesign looks for an identity only in the keychains of the search list.
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/identity.p12"
-      - name: Release, or do a dry run
+      - name: Build, with the disk image and the feed
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # The step must go on after a failed release, to print the reason.
+          # The step must go on after a failed build, to print the reason.
           set +e
           cd source
           if [ "$DRY_RUN" = "true" ]; then
-            app/scripts/release.sh --dry-run > "$RUNNER_TEMP/release.log" 2>&1
+            app/scripts/release.sh --dry-run --only "$ARCH" > "$RUNNER_TEMP/release.log" 2>&1
           else
-            RELEASE_TAG="$REF" app/scripts/release.sh > "$RUNNER_TEMP/release.log" 2>&1
+            RELEASE_TAG="$REF" app/scripts/release.sh --only "$ARCH" > "$RUNNER_TEMP/release.log" 2>&1
           fi
           status=$?
           # Only the lines of the release script itself. The output of the compiler stays hidden.
           grep -E '^(No release:|Built |Released |Dry run:|No published feed|Wrote |https://github.com/)' "$RUNNER_TEMP/release.log" || true
           if [ "$status" != 0 ]; then
-            echo "The release failed. The build output is hidden. Run app/scripts/release.sh --dry-run on a Mac to see it."
+            echo "The build failed. The build output is hidden. Run app/scripts/release.sh --dry-run on a Mac to see it."
             exit 1
           fi
       - name: Check the signature
+        env:
+          APP: ${{ matrix.app }}
+          IMAGE: ${{ matrix.image }}
         run: |
-          codesign --verify --deep --strict source/app/build/Snappd.app
+          codesign --verify --deep --strict "$APP"
           # The same line for each release: the app and the certificate that signed it.
-          codesign -d -r- source/app/build/Snappd.app 2>&1 | tail -1
-          hdiutil imageinfo source/app/build/release/Snappd.dmg >/dev/null && echo "The disk image is good."
+          codesign -d -r- "$APP" 2>&1 | tail -1
+          hdiutil imageinfo "$IMAGE" >/dev/null && echo "The disk image is good."
+      # The files of this build go to the job that publishes. The disk image is public after the release anyway.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.arch }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # Publishes the files of the two builds as one release. It needs no signing key, so it runs on Linux.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      REF: ${{ inputs.ref }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      GIT_SSH_COMMAND: ssh -i ~/.ssh/source -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/github_host -o StrictHostKeyChecking=yes
+    steps:
+      - name: Get the source
+        env:
+          SOURCE_DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        run: |
+          set -eu
+          printf '%s' "$REF" | grep -Eq '^(main|v[0-9]+\.[0-9]+\.[0-9]+)$' || { echo "The ref must be main or a tag such as v1.2.3."; exit 1; }
+          if [ "$DRY_RUN" != "true" ] && [ "$REF" = "main" ]; then echo "A release needs a version tag."; exit 1; fi
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SOURCE_DEPLOY_KEY" > ~/.ssh/source
+          # The host key of GitHub, from https://docs.github.com/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+          printf '%s\n' "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/github_host
+          # The full history: the build number is the number of commits.
+          git clone --quiet git@github.com:beardwhocodes/snappd.git source
+          git -C source checkout --quiet "$REF"
+          echo "Source: $REF, commit $(git -C source rev-parse --short HEAD)"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-arm64
+          path: source/app/build/release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-x86_64
+          path: source/app/build/release-intel
+      - name: Publish, or end the dry run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd source
+          if [ "$DRY_RUN" = "true" ]; then
+            app/scripts/release.sh --dry-run --only publish
+          else
+            RELEASE_TAG="$REF" app/scripts/release.sh --only publish
+          fi
